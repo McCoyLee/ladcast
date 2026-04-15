@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional
 
 import numpy as np
@@ -203,6 +204,42 @@ def prepare_ar_dataloader(
     # -- 2) Open the underlying zarr array directly (no xarray cache) --
     zarr_arr, zarr_dims, canonical_axis_map = _open_zarr_array(ds_path, var_name)
 
+    # ---- Memory diagnostics (helps catch host-RAM blowups before training starts) ----
+    _dtype_size = np.dtype(zarr_arr.dtype).itemsize
+    if "C" in canonical_axis_map:
+        _C = int(zarr_arr.shape[canonical_axis_map["C"]])
+    else:
+        _C = 1
+    _H = int(zarr_arr.shape[canonical_axis_map["H"]])
+    _W = int(zarr_arr.shape[canonical_axis_map["W"]])
+    _effective_time_len = len(selected_time_values[truncate_first::sampling_interval])
+    _full_dataset_bytes = _C * _effective_time_len * _H * _W * _dtype_size
+
+    _seq_frames = input_seq_len + return_seq_len
+    _sample_bytes = _C * _seq_frames * _H * _W * 4  # __getitem__ casts to float32
+    _prefetch = 0 if (num_workers == 0 or prefetch_factor is None) else int(prefetch_factor)
+    _queue_batches = 1 if num_workers == 0 else max(1, int(num_workers) * max(1, _prefetch))
+    _peak_prefetch_bytes = _queue_batches * int(batch_size) * _sample_bytes
+
+    print(
+        "[prepare_ar_dataloader] memory estimate: "
+        f"full_dataset~{_full_dataset_bytes / 1024**3:.2f} GiB, "
+        f"sample~{_sample_bytes / 1024**2:.2f} MiB "
+        f"(C={_C}, T={_seq_frames}, H={_H}, W={_W}), "
+        f"prefetch_queue~{_peak_prefetch_bytes / 1024**3:.2f} GiB "
+        f"(workers={num_workers}, prefetch_factor={prefetch_factor}, batch={batch_size})"
+    )
+
+    if load_in_memory:
+        max_inmem_gb = float(os.getenv("LADCAST_MAX_INMEMORY_GB", "64"))
+        if (_full_dataset_bytes / 1024**3) > max_inmem_gb:
+            raise MemoryError(
+                "Refusing load_in_memory=True because estimated in-memory dataset size is "
+                f"{_full_dataset_bytes / 1024**3:.2f} GiB (> LADCAST_MAX_INMEMORY_GB={max_inmem_gb:g}). "
+                "Set load_in_memory=false, shorten time range, or raise LADCAST_MAX_INMEMORY_GB "
+                "if you intentionally want to load everything."
+            )
+
     if not profiling:
         tmp_dataset = XarrayDataset3D(
             zarr_arr=zarr_arr,
@@ -336,9 +373,7 @@ class XarrayDataset3D(Dataset):
             input_seq_len + return_seq_len - 1
         ) * interval_between_pred + 1
         if length is None:
-            self.length = (
-                len(self._time_values) - self.full_seq_len - truncate_first + 1
-            )
+            self.length = len(self._time_values) - self.full_seq_len + 1
             print(
                 f"[XarrayDataset3D] using direct zarr access. "
                 f"Subsampled time len={len(self._time_values)}, "
