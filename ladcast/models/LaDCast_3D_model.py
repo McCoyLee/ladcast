@@ -926,16 +926,27 @@ class LaDCastTransformer3DModel(
                 cond_sin.repeat_interleave(post_patch_height * post_patch_width, dim=0),
             )
         else:
+            spatial_start = self.rope_spatial_grid_start_pos
+            if not isinstance(spatial_start, (list, tuple)):
+                spatial_start = [spatial_start, spatial_start]
+            spatial_end = self.rope_spatial_grid_end_pos
+            if spatial_end is None:
+                spatial_end = [
+                    spatial_start[0] + post_patch_height - 1,
+                    spatial_start[1] + post_patch_width - 1,
+                ]
+            elif not isinstance(spatial_end, (list, tuple)):
+                spatial_end = [spatial_end, spatial_end]
             lat_coord = torch.linspace(
-                self.rope_spatial_grid_start_pos[0],
-                self.rope_spatial_grid_end_pos[0],
+                spatial_start[0],
+                spatial_end[0],
                 steps=post_patch_height,
                 device=hidden_states.device,
                 dtype=torch.float32,
             )
             lon_coord = torch.linspace(
-                self.rope_spatial_grid_start_pos[1],
-                self.rope_spatial_grid_end_pos[1],
+                spatial_start[1],
+                spatial_end[1],
                 steps=post_patch_width,
                 device=hidden_states.device,
                 dtype=torch.float32,

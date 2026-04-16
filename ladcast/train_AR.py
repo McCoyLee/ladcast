@@ -683,8 +683,22 @@ def main(args):
                 if ema_config.use_ema:
                     ema_model.save_pretrained(os.path.join(output_dir, "ar_model_ema"))
 
-                for i, model in enumerate(models):
-                    model.save_pretrained(os.path.join(output_dir, "ar_model"))
+                for model in models:
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    if hasattr(unwrapped_model, "save_pretrained"):
+                        unwrapped_model.save_pretrained(
+                            os.path.join(output_dir, "ar_model")
+                        )
+                    elif isinstance(unwrapped_model, TerrainEncoder):
+                        torch.save(
+                            unwrapped_model.state_dict(),
+                            os.path.join(output_dir, "terrain_encoder.pt"),
+                        )
+                    else:
+                        raise TypeError(
+                            "Don't know how to save model of type "
+                            f"{type(unwrapped_model).__name__}"
+                        )
 
                     # make sure to pop weight so that corresponding model is not saved again
                     weights.pop()
@@ -719,14 +733,29 @@ def main(args):
             for _ in range(len(models)):
                 # pop models so that they are not loaded again
                 model = models.pop()
+                unwrapped_model = accelerator.unwrap_model(model)
+
+                if isinstance(unwrapped_model, TerrainEncoder):
+                    terrain_path = os.path.join(input_dir, "terrain_encoder.pt")
+                    if not os.path.exists(terrain_path):
+                        raise FileNotFoundError(
+                            f"Terrain encoder checkpoint not found: {terrain_path}"
+                        )
+                    state_dict = torch.load(
+                        terrain_path,
+                        map_location="cpu",
+                        weights_only=True,
+                    )
+                    unwrapped_model.load_state_dict(state_dict)
+                    continue
 
                 # load diffusers style into model
                 load_model = ar_model_cls.from_pretrained(
                     input_dir, subfolder="ar_model"
                 )
-                model.register_to_config(**load_model.config)
+                unwrapped_model.register_to_config(**load_model.config)
 
-                model.load_state_dict(load_model.state_dict())
+                unwrapped_model.load_state_dict(load_model.state_dict())
                 del load_model
 
         accelerator.register_save_state_pre_hook(save_model_hook)
@@ -1494,6 +1523,11 @@ def main(args):
                 unwrap_model(ar_model).save_pretrained(
                     os.path.join(general_config.output_dir, "ar_model")
                 )
+                if terrain_encoder is not None:
+                    torch.save(
+                        unwrap_model(terrain_encoder).state_dict(),
+                        os.path.join(general_config.output_dir, "terrain_encoder.pt"),
+                    )
 
                 if ema_config.use_ema:
                     ema_model.restore(ar_model.parameters())

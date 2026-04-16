@@ -2,6 +2,7 @@ import os
 from typing import List, Optional
 
 import numpy as np
+import pandas as pd
 import torch
 import xarray as xr
 import zarr
@@ -53,6 +54,75 @@ def _resolve_canonical(name: str) -> Optional[str]:
     return None
 
 
+def _resolve_zarr_var_name(z_root, var_name: str) -> str:
+    """Resolve latent/latents aliases against a zarr root without xarray."""
+    var_name = var_name.strip()
+    candidates = [var_name, var_name.lower(), var_name.lower().rstrip("s")]
+    if var_name in ("latent", "latents"):
+        candidates.extend(["latent", "latents"])
+    for name in candidates:
+        if name and name in z_root:
+            return name
+
+    available_vars = [
+        name
+        for name in z_root.array_keys()
+        if name not in {"time"} and not name.startswith(".")
+    ]
+    normalized_target = var_name.lower().rstrip("s")
+    fallback_candidates = [
+        name
+        for name in available_vars
+        if name.lower().rstrip("s") == normalized_target
+    ]
+    if len(fallback_candidates) == 1:
+        return fallback_candidates[0]
+
+    raise KeyError(
+        f"Variable '{var_name}' not found in zarr store. "
+        f"Available arrays: {available_vars}."
+    )
+
+
+def _decode_zarr_time(raw_time: np.ndarray, attrs: dict) -> np.ndarray:
+    """Decode a 1-D zarr time coordinate to numpy datetime64[ns]."""
+    raw_time = np.asarray(raw_time)
+    if np.issubdtype(raw_time.dtype, np.datetime64):
+        return raw_time.astype("datetime64[ns]")
+
+    units = attrs.get("units", "")
+    if " since " not in units:
+        raise ValueError(
+            "Cannot decode zarr time coordinate without CF-style units. "
+            f"time dtype={raw_time.dtype}, attrs={attrs}"
+        )
+    unit_name, origin = units.split(" since ", 1)
+    unit_name = unit_name.strip().lower()
+    unit_map = {
+        "nanosecond": "ns",
+        "nanoseconds": "ns",
+        "microsecond": "us",
+        "microseconds": "us",
+        "millisecond": "ms",
+        "milliseconds": "ms",
+        "second": "s",
+        "seconds": "s",
+        "minute": "m",
+        "minutes": "m",
+        "hour": "h",
+        "hours": "h",
+        "day": "D",
+        "days": "D",
+    }
+    if unit_name not in unit_map:
+        raise ValueError(f"Unsupported zarr time unit in {units!r}.")
+
+    decoded = pd.Timestamp(origin.strip()) + pd.to_timedelta(
+        raw_time, unit=unit_map[unit_name]
+    )
+    return decoded.to_numpy(dtype="datetime64[ns]")
+
+
 def _open_zarr_array(zarr_path: str, var_name: str):
     """Open the underlying zarr array for a variable, bypassing xarray.
 
@@ -67,27 +137,47 @@ def _open_zarr_array(zarr_path: str, var_name: str):
         Mapping from canonical names ('C', 'time', 'H', 'W') to axis indices.
     """
     z = zarr.open(zarr_path, mode="r")
-    # Resolve variable name (handle latent vs latents alias)
-    candidates = [var_name, var_name.lower(), var_name.lower().rstrip("s")]
-    if var_name in ("latent", "latents"):
-        candidates.extend(["latent", "latents"])
-    arr = None
-    for name in candidates:
-        if name in z:
-            arr = z[name]
-            break
-    if arr is None:
-        raise KeyError(
-            f"Variable '{var_name}' not found in zarr store at {zarr_path}. "
-            f"Candidates tried: {candidates}"
-        )
+    var_name = _resolve_zarr_var_name(z, var_name)
+    arr = z[var_name]
 
     zarr_dims = list(arr.attrs.get("_ARRAY_DIMENSIONS", []))
     if not zarr_dims:
-        raise ValueError(
-            f"Zarr variable '{var_name}' has no '_ARRAY_DIMENSIONS' attribute. "
-            "Cannot determine dim ordering for direct zarr access."
-        )
+        coord_lengths = {}
+        for coord_name in ("time", "channel", "C", "lat", "H", "lon", "W"):
+            if coord_name in z and hasattr(z[coord_name], "shape"):
+                coord_lengths[coord_name] = int(z[coord_name].shape[0])
+
+        inferred_dims = []
+        used_coords = set()
+        for axis_size in arr.shape:
+            matches = [
+                name
+                for name, length in coord_lengths.items()
+                if length == axis_size and name not in used_coords
+            ]
+            if not matches:
+                inferred_dims = []
+                break
+            preferred = sorted(
+                matches,
+                key=lambda name: (
+                    0
+                    if name in ("time", "channel", "lat", "lon")
+                    else 1,
+                    name,
+                ),
+            )[0]
+            inferred_dims.append(preferred)
+            used_coords.add(preferred)
+
+        if len(inferred_dims) == arr.ndim:
+            zarr_dims = inferred_dims
+        else:
+            raise ValueError(
+                f"Zarr variable '{var_name}' has no '_ARRAY_DIMENSIONS' "
+                "attribute and dimensions could not be inferred from coordinate "
+                f"lengths. shape={arr.shape}, coord_lengths={coord_lengths}"
+            )
 
     canonical_axis_map = {}
     for i, d in enumerate(zarr_dims):
@@ -133,75 +223,42 @@ def prepare_ar_dataloader(
     profiling: Optional[bool] = False,
     load_in_memory: Optional[bool] = False,
 ):
-    # -- 1) Open xarray ONLY to extract metadata (time coords, time slicing) --
-    #    We then close it immediately so its lazy/zarr cache layers can't grow.
-    xarr = xr.open_dataset(ds_path, engine=xr_engine, chunks=None)
-    xarr = _normalize_zarr_dataset(xarr)
-    xarr = xarr.sel(time=slice(start_date, end_date))
-
-    # Resolve variable name
-    var_name = var_name.strip()
-    if var_name not in xarr:
-        available_vars = list(xarr.data_vars)
-        alias_priority = [var_name, var_name.lower(), var_name.lower().rstrip("s")]
-        explicit_aliases = {"latents": "latent", "latent": "latents"}
-        alias_priority.extend(explicit_aliases.get(name, "") for name in alias_priority)
-        alias_priority = [name for name in alias_priority if name]
-        matched = next((name for name in alias_priority if name in available_vars), None)
-        if matched is None:
-            normalized_target = var_name.lower().rstrip("s")
-            fallback_candidates = [
-                name for name in available_vars
-                if name.lower().rstrip("s") == normalized_target
-            ]
-            if len(fallback_candidates) == 1:
-                matched = fallback_candidates[0]
-        if matched is None:
-            raise KeyError(
-                f"Variable '{var_name}' not found in dataset. "
-                f"Available vars: {available_vars}."
-            )
-        print(
-            f"[prepare_ar_dataloader] var_name '{var_name}' not found, "
-            f"auto-using alias '{matched}'."
-        )
-        var_name = matched
-
-    data = xarr[var_name]
-
-    # Compute the integer time-slice that `xarr.sel(time=slice(start, end))`
-    # selected, expressed as offsets into the ORIGINAL zarr time axis.
-    # We pull the *full* time coord straight from zarr (small 1-D array)
-    # to avoid having to re-open xarray.
-    selected_time = data.time.values.copy()
-
-    # Read the full time coord directly from zarr — small (~1-D)
-    _z_root = zarr.open(ds_path, mode="r")
-    full_time = np.asarray(_z_root["time"][:])
-
-    first_match = int(np.searchsorted(full_time, selected_time[0]))
-    last_match = int(np.searchsorted(full_time, selected_time[-1])) + 1
-    if not (
-        0 <= first_match < len(full_time)
-        and full_time[first_match] == selected_time[0]
-    ):
+    if xr_engine != "zarr":
         raise ValueError(
-            f"start time {selected_time[0]} not found exactly in zarr time coord"
+            "prepare_ar_dataloader uses direct zarr access and requires "
+            f"xr_engine='zarr', got {xr_engine!r}."
         )
-    time_start_in_zarr = first_match
-    time_stop_in_zarr = last_match
 
-    # Save the time values we need (post date-slicing) — small, fits in memory
-    selected_time_values = selected_time
+    # Open only zarr metadata and the small 1-D time coordinate.  Avoid
+    # xr.open_dataset here: on large zarr stores it can scan/cache substantial
+    # metadata before the first batch, which was the observed host-RAM blowup.
+    z_root = zarr.open(ds_path, mode="r")
+    var_name = _resolve_zarr_var_name(z_root, var_name)
+    if "time" not in z_root:
+        raise KeyError(f"Zarr store {ds_path} does not contain a 'time' coordinate.")
+    full_time_values = _decode_zarr_time(z_root["time"][:], dict(z_root["time"].attrs))
+    full_time_index = pd.DatetimeIndex(full_time_values)
 
-    # Close & release xarray references — we only need raw zarr from here on
-    try:
-        xarr.close()
-    except Exception:
-        pass
-    del xarr, data, full_time, selected_time, _z_root
+    # Work out selected integer positions into the raw zarr time axis.
+    time_indexer = full_time_index.slice_indexer(start_date, end_date)
+    if not isinstance(time_indexer, slice):
+        selected_positions = np.asarray(time_indexer, dtype=np.int64)
+    else:
+        start = 0 if time_indexer.start is None else time_indexer.start
+        stop = len(full_time_index) if time_indexer.stop is None else time_indexer.stop
+        step = 1 if time_indexer.step is None else time_indexer.step
+        selected_positions = np.arange(start, stop, step, dtype=np.int64)
+    if selected_positions.size == 0:
+        raise ValueError(
+            f"No timestamps selected from {ds_path} for range "
+            f"{start_date!r} to {end_date!r}."
+        )
+    time_start_in_zarr = int(selected_positions[0])
+    time_stop_in_zarr = int(selected_positions[-1]) + 1
+    selected_time_values = full_time_values[selected_positions].copy()
+    del full_time_values, full_time_index, selected_positions, z_root
 
-    # -- 2) Open the underlying zarr array directly (no xarray cache) --
+    # Open the underlying zarr array directly (no xarray cache).
     zarr_arr, zarr_dims, canonical_axis_map = _open_zarr_array(ds_path, var_name)
 
     # ---- Memory diagnostics (helps catch host-RAM blowups before training starts) ----
