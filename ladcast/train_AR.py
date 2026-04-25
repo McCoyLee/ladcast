@@ -148,6 +148,20 @@ def log_validation(
     if terrain_features is not None:
         _val_sampler_kwargs["model_kwargs"] = _val_model_kwargs
 
+    latent_channels = int(xr_dataset["latents"].sizes["C"])
+    encdec_latent_channels = int(
+        getattr(encdec_model.config, "latent_channels", latent_channels)
+    )
+    if latent_channels != encdec_latent_channels:
+        logger.warning(
+            "Skipping physical-space validation because dataset latent channels (%d) "
+            "do not match encdec latent_channels (%d). This run is latent-only; "
+            "use --skip_encdec to avoid loading DC-AE next time.",
+            latent_channels,
+            encdec_latent_channels,
+        )
+        return None
+
     latitude = np.linspace(-88.5, 90, 120)  # crop south pole
     lat_weight = get_normalized_lat_weights_based_on_cos(latitude)  # (lat,)
     lat_weight = torch.from_numpy(lat_weight).to(accelerator.device)  # (lat,)
@@ -427,6 +441,36 @@ def parse_args():
         help=("If True, load weights only from the checkpoint (not the EMA)."),
     )
     parser.add_argument(
+        "--init_ar_model_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a pretrained AR model directory to warm-start from. "
+            "Useful for initializing terrain runs from a stronger no-terrain baseline."
+        ),
+    )
+    parser.add_argument(
+        "--init_terrain_encoder_path",
+        type=str,
+        default=None,
+        help="Optional path to a pretrained terrain_encoder.pt to warm-start the terrain branch.",
+    )
+    parser.add_argument(
+        "--terrain_lr_scale",
+        type=float,
+        default=1.0,
+        help="Learning-rate multiplier applied to terrain-specific parameters.",
+    )
+    parser.add_argument(
+        "--freeze_ar_steps",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, freeze non-terrain AR parameters for the first N optimization steps. "
+            "Recommended when warm-starting a terrain run from a strong baseline."
+        ),
+    )
+    parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
         default=None,
@@ -517,6 +561,34 @@ def parse_args():
         help="Use SHT backend (requires torch_harmonics) instead of FFT for TerrainEncoder.",
     )
     parser.add_argument(
+        "--terrain_alpha_init",
+        type=float,
+        default=None,
+        help=(
+            "Optional logit initialization for the AR-side terrain injection gate. "
+            "0.0 gives sigmoid=0.5; the model default is -2.0."
+        ),
+    )
+    parser.add_argument(
+        "--terrain_output_gate_init",
+        type=float,
+        default=None,
+        help=(
+            "Optional logit initialization for the TerrainEncoder output gate. "
+            "0.0 gives sigmoid=0.5."
+        ),
+    )
+    parser.add_argument(
+        "--zero_terrain_features",
+        action="store_true",
+        default=False,
+        help=(
+            "Control experiment for terrain runs: keep the terrain branch in the "
+            "model, but replace computed terrain features with zeros during "
+            "training and validation."
+        ),
+    )
+    parser.add_argument(
         "--lsm_path",
         type=str,
         default="ladcast/static/240x121_land_sea_mask.pt",
@@ -573,13 +645,49 @@ def main(args):
         ar_model_cls = LaDCastTransformer3DModel
     else:
         raise NotImplementedError(f"Unknown autoregressive model class: {args.ar_cls}")
+    if args.use_terrain and args.terrain_alpha_init is not None:
+        ar_model_config["terrain_alpha_init"] = float(args.terrain_alpha_init)
     ar_model = ar_model_cls.from_config(config=ar_model_config)
     ar_model.requires_grad_(True)
+
+    if args.init_ar_model_path:
+        init_ar_model = ar_model_cls.from_pretrained(
+            args.init_ar_model_path,
+            low_cpu_mem_usage=False,
+        )
+        missing_keys, unexpected_keys = ar_model.load_state_dict(
+            init_ar_model.state_dict(), strict=False
+        )
+        logger.info(
+            "Warm-started AR model from %s (missing=%d, unexpected=%d)",
+            args.init_ar_model_path,
+            len(missing_keys),
+            len(unexpected_keys),
+        )
+        if missing_keys:
+            logger.info("AR warm-start missing keys: %s", missing_keys)
+        if unexpected_keys:
+            logger.info("AR warm-start unexpected keys: %s", unexpected_keys)
+        del init_ar_model
 
     # --- Terrain encoder (GSNO) ---
     terrain_encoder = None
     static_terrain_input = None
     if args.use_terrain:
+        expected_terrain_channels = int(ar_model_config.get("terrain_channels", 0) or 0)
+        if expected_terrain_channels <= 0:
+            raise ValueError(
+                "--use_terrain was set, but ar_model.terrain_channels <= 0 in the config. "
+                "Set ar_model.terrain_channels to a positive value."
+            )
+        terrain_out_channels = expected_terrain_channels
+        if args.terrain_out_channels != expected_terrain_channels:
+            logger.warning(
+                "Overriding --terrain_out_channels=%d to match ar_model.terrain_channels=%d",
+                args.terrain_out_channels,
+                expected_terrain_channels,
+            )
+
         # Infer latent spatial resolution from data
         _tmp_ds = xr.open_dataset(train_dataloader_config.ds_path, engine="zarr", chunks=None)
         _tmp_ds = _normalize_zarr_dataset(_tmp_ds)
@@ -590,14 +698,37 @@ def main(args):
         terrain_encoder = TerrainEncoder(
             in_channels=5,  # 1 LSM + 4 orography
             embed_dim=args.terrain_embed_dim,
-            out_channels=args.terrain_out_channels,
+            out_channels=terrain_out_channels,
             phys_nlat=120,   # after south pole crop
             phys_nlon=240,
             latent_nlat=_latent_nlat,
             latent_nlon=_latent_nlon,
             use_sht=args.terrain_use_sht,
+            output_gate_init=0.0
+            if args.terrain_output_gate_init is None
+            else args.terrain_output_gate_init,
         )
         terrain_encoder.requires_grad_(True)
+        if args.init_terrain_encoder_path:
+            terrain_state_dict = torch.load(
+                args.init_terrain_encoder_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            missing_keys, unexpected_keys = terrain_encoder.load_state_dict(
+                terrain_state_dict,
+                strict=False,
+            )
+            logger.info(
+                "Warm-started terrain encoder from %s (missing=%d, unexpected=%d)",
+                args.init_terrain_encoder_path,
+                len(missing_keys),
+                len(unexpected_keys),
+            )
+            if missing_keys:
+                logger.info("Terrain warm-start missing keys: %s", missing_keys)
+            if unexpected_keys:
+                logger.info("Terrain warm-start unexpected keys: %s", unexpected_keys)
 
         # Load static fields
         lsm_tensor = torch.load(args.lsm_path, weights_only=True)         # (121, 240)
@@ -706,7 +837,7 @@ def main(args):
         def EMA_from_pretrained(path, model_cls) -> "EMAModel":
             # _, ema_kwargs = model_cls.load_config(path, return_unused_kwargs=True)
             model_config = model_cls.load_config(path)  # contains ema_kwargs
-            model = model_cls.from_pretrained(path)
+            model = model_cls.from_pretrained(path, low_cpu_mem_usage=False)
 
             ema_model = EMAModel(
                 model.parameters(), model_cls=model_cls, model_config=model.config
@@ -751,7 +882,9 @@ def main(args):
 
                 # load diffusers style into model
                 load_model = ar_model_cls.from_pretrained(
-                    input_dir, subfolder="ar_model"
+                    input_dir,
+                    subfolder="ar_model",
+                    low_cpu_mem_usage=False,
                 )
                 unwrapped_model.register_to_config(**load_model.config)
 
@@ -848,13 +981,72 @@ def main(args):
             * train_dataloader_config.batch_size
         )
 
-    # Combine parameters: ar_model + optional terrain_encoder
-    trainable_params = list(ar_model.parameters())
+    if terrain_encoder is not None and args.freeze_ar_steps > 0:
+        frozen_count = 0
+        for name, param in ar_model.named_parameters():
+            if name.startswith("terrain_"):
+                continue
+            if param.requires_grad:
+                param.requires_grad_(False)
+                frozen_count += 1
+        logger.info(
+            "Freezing %d non-terrain AR parameters for the first %d steps",
+            frozen_count,
+            args.freeze_ar_steps,
+        )
+
+    # Combine parameters with a more conservative LR for terrain-specific branches.
+    optimizer_kwargs = OmegaConf.to_container(optimizer_config, resolve=True)
+    base_lr = optimizer_kwargs.pop("lr")
+    base_weight_decay = optimizer_kwargs.get("weight_decay", 0.0)
+
+    ar_main_params = []
+    terrain_branch_params = []
+    no_decay_params = []
+
+    for name, param in ar_model.named_parameters():
+        if name.startswith("terrain_"):
+            if name.endswith("alpha"):
+                no_decay_params.append(param)
+            else:
+                terrain_branch_params.append(param)
+        else:
+            ar_main_params.append(param)
+
     if terrain_encoder is not None:
-        trainable_params += list(terrain_encoder.parameters())
-    optimizer = AdamW(
-        trainable_params, **OmegaConf.to_container(optimizer_config, resolve=True)
-    )
+        for name, param in terrain_encoder.named_parameters():
+            if name.endswith("output_gate"):
+                no_decay_params.append(param)
+            else:
+                terrain_branch_params.append(param)
+
+    optimizer_param_groups = []
+    if ar_main_params:
+        optimizer_param_groups.append(
+            {
+                "params": ar_main_params,
+                "lr": base_lr,
+                "weight_decay": base_weight_decay,
+            }
+        )
+    if terrain_branch_params:
+        optimizer_param_groups.append(
+            {
+                "params": terrain_branch_params,
+                "lr": base_lr * args.terrain_lr_scale,
+                "weight_decay": base_weight_decay,
+            }
+        )
+    if no_decay_params:
+        optimizer_param_groups.append(
+            {
+                "params": no_decay_params,
+                "lr": base_lr * args.terrain_lr_scale,
+                "weight_decay": 0.0,
+            }
+        )
+
+    optimizer = AdamW(optimizer_param_groups, **optimizer_kwargs)
 
     if "subbatch_steps" in general_config:
         num_subbatch_steps = int(
@@ -959,6 +1151,8 @@ def main(args):
         accelerator.init_trackers(
             general_config.tracker_project_name, config=tracker_config
         )
+        os.makedirs(general_config.output_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
 
     # Function for unwrapping if model was compiled with `torch.compile`.
     def unwrap_model(model):
@@ -1013,7 +1207,8 @@ def main(args):
             # if accelerator.is_main_process: # temp fix for only having one random state
             if args.load_weights_only:
                 ar_model = ar_model_cls.from_pretrained(
-                    os.path.join(general_config.output_dir, path, "ar_model")
+                    os.path.join(general_config.output_dir, path, "ar_model"),
+                    low_cpu_mem_usage=False,
                 )
                 ema_model = EMAModel(
                     ar_model.parameters(),
@@ -1088,11 +1283,27 @@ def main(args):
     _gc_interval = 10  # gc.collect every N steps (was 200 — too infrequent)
     _prev_rss, _, _ = _get_rss_gb()
     logger.info(f"[mem] baseline RSS before training loop: {_prev_rss:.2f} GB")
+    ar_is_frozen = terrain_encoder is not None and args.freeze_ar_steps > 0
 
     for epoch in range(first_epoch, general_config.num_train_epochs):
         ar_model.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
+            if ar_is_frozen and global_step >= args.freeze_ar_steps:
+                unfrozen_count = 0
+                for name, param in ar_model.named_parameters():
+                    if name.startswith("terrain_"):
+                        continue
+                    if not param.requires_grad:
+                        param.requires_grad_(True)
+                        unfrozen_count += 1
+                ar_is_frozen = False
+                logger.info(
+                    "Unfroze %d non-terrain AR parameters at global_step=%d",
+                    unfrozen_count,
+                    global_step,
+                )
+
             _accumulate_models = [ar_model, terrain_encoder] if terrain_encoder is not None else [ar_model]
             with accelerator.accumulate(*_accumulate_models):
                 # initial_profile: (B, C, T, H, W), clean_images: (B, C, T, H, W), timestamps: (B,)
@@ -1107,6 +1318,8 @@ def main(args):
                     terrain_encoder.train()
                     terrain_batch = static_terrain_input.expand(bs, -1, -1, -1)
                     terrain_feats = terrain_encoder(terrain_batch)
+                    if args.zero_terrain_features:
+                        terrain_feats = torch.zeros_like(terrain_feats)
 
                 # Sample a random timestep for each image
                 # diffusers/examples/dreambooth/train_dreambooth_lora_sdxl.py
@@ -1378,6 +1591,16 @@ def main(args):
                     "lr": lr_scheduler.get_last_lr()[0],
                     "step": global_step,
                 }
+                if terrain_encoder is not None:
+                    logs["terrain/output_gate"] = torch.sigmoid(
+                        unwrap_model(terrain_encoder).output_gate.detach()
+                    ).item()
+                    logs["terrain/inject_alpha"] = torch.sigmoid(
+                        unwrap_model(ar_model).terrain_alpha.detach()
+                    ).item()
+                    logs["terrain/net_scale"] = (
+                        logs["terrain/output_gate"] * logs["terrain/inject_alpha"]
+                    )
                 if ema_config.use_ema:
                     logs["ema_decay"] = ema_model.cur_decay_value
                 global_step += 1
@@ -1482,6 +1705,8 @@ def main(args):
                         terrain_encoder.eval()
                         with torch.no_grad():
                             _val_terrain = terrain_encoder(static_terrain_input)
+                        if args.zero_terrain_features:
+                            _val_terrain = torch.zeros_like(_val_terrain)
                     log_validation(
                         "val",
                         xr_dataset=val_dataset,

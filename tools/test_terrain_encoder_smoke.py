@@ -116,7 +116,7 @@ def test_terrain_encoder_gradient():
 
 
 def test_gate_initialization():
-    """Output gate should start at zero."""
+    """Output gate should start at a neutral 0.5 scale."""
     encoder = TerrainEncoder(
         in_channels=5,
         embed_dim=16,
@@ -130,7 +130,8 @@ def test_gate_initialization():
 
     gate_val = encoder.output_gate.item()
     gate_sigmoid = torch.sigmoid(encoder.output_gate).item()
-    assert abs(gate_val) < 1e-6, f"Gate should be 0, got {gate_val}"
+    assert abs(gate_val) < 1e-6, f"Gate raw value should start at 0, got {gate_val}"
+    assert abs(gate_sigmoid - 0.5) < 1e-6, f"Gate sigmoid should start at 0.5, got {gate_sigmoid}"
     print(
         f"PASS: Gate init test (raw={gate_val:.6f}, sigmoid={gate_sigmoid:.4f})"
     )

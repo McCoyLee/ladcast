@@ -648,6 +648,7 @@ class LaDCastTransformer3DModel(
         nope: bool = False,
         scale_attn_by_lat: bool = False,
         terrain_channels: int = 0,
+        terrain_alpha_init: float = -2.0,
     ) -> None:
         super().__init__()
 
@@ -687,6 +688,10 @@ class LaDCastTransformer3DModel(
                 terrain_channels,
                 inner_dim,
             )
+            self.terrain_norm = nn.LayerNorm(inner_dim, elementwise_affine=False)
+            # Logit-space gate. The default keeps old checkpoints/configs
+            # behavior-compatible: sigmoid(-2) ~= 0.119.
+            self.terrain_alpha = nn.Parameter(torch.full((1,), float(terrain_alpha_init)))
 
         self.scale_attn_by_lat = scale_attn_by_lat
         if scale_attn_by_lat:
@@ -979,7 +984,11 @@ class LaDCastTransformer3DModel(
                 -1, -1, T_cond, -1, -1
             )
             terrain_tokens = self.terrain_embedder(terrain_5d)  # (B, N_patch, C)
-            encoder_hidden_states = encoder_hidden_states + terrain_tokens
+            terrain_tokens = self.terrain_norm(terrain_tokens)
+            terrain_scale = torch.sigmoid(self.terrain_alpha).to(
+                dtype=terrain_tokens.dtype
+            )
+            encoder_hidden_states = encoder_hidden_states + terrain_scale * terrain_tokens
 
         with torch.autocast(hidden_states.device.type, torch.float32):
             temb = self.time_text_embed(

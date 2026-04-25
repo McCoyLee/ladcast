@@ -23,6 +23,7 @@ from ladcast.dataloader.utils import (
 )
 from ladcast.models.DCAE import AutoencoderDC
 from ladcast.models.LaDCast_3D_model import LaDCastTransformer3DModel
+from ladcast.models.terrain_encoder import TerrainEncoder
 from ladcast.pipelines.pipeline_AR import AutoRegressive2DPipeline
 from ladcast.pipelines.utils import roll_out_serial
 from ladcast.utils import instantiate_from_config
@@ -50,6 +51,13 @@ noise_scheduler_config = {
     "target": "diffusers.EDMDPMSolverMultistepScheduler",
     "param": {"sigma_data": 0.5},
 }
+
+
+def crop_south_pole(ds):
+    latitude = ds.latitude.values
+    if latitude[0] < latitude[-1]:
+        return ds.sel(latitude=slice(-88.5, 90))
+    return ds.sel(latitude=slice(90, -88.5)).sortby("latitude")
 
 
 def fix_time_encoding_for_zarr(ds):
@@ -212,6 +220,58 @@ def parse_args():
         default=0,
         help="Noise level for perturbing the latent",
     )
+    parser.add_argument(
+        "--terrain_encoder_path",
+        type=str,
+        default=None,
+        help="Path to terrain_encoder.pt for terrain-conditioned AR checkpoints.",
+    )
+    parser.add_argument(
+        "--terrain_embed_dim",
+        type=int,
+        default=64,
+        help="Hidden dimension used by TerrainEncoder during training.",
+    )
+    parser.add_argument(
+        "--terrain_latent_nlat",
+        type=int,
+        default=32,
+        help="TerrainEncoder latent latitude size.",
+    )
+    parser.add_argument(
+        "--terrain_latent_nlon",
+        type=int,
+        default=60,
+        help="TerrainEncoder latent longitude size.",
+    )
+    parser.add_argument(
+        "--terrain_use_sht",
+        action="store_true",
+        default=False,
+        help="Use SHT backend for TerrainEncoder, matching train_AR.py.",
+    )
+    parser.add_argument(
+        "--zero_terrain_features",
+        action="store_true",
+        default=False,
+        help=(
+            "Ablation switch for terrain-conditioned checkpoints: compute and load "
+            "the terrain branch normally, then pass all-zero terrain features to "
+            "the AR model."
+        ),
+    )
+    parser.add_argument(
+        "--crop_south_pole",
+        action="store_true",
+        default=False,
+        help="Crop the south-pole row before encoding. Do not use for RouteB padded latents.",
+    )
+    parser.add_argument(
+        "--pad_input_height_to",
+        type=int,
+        default=128,
+        help="Pad normalized physical inputs to this height before encoder-decoder encoding.",
+    )
     return parser.parse_args()
 
 
@@ -245,21 +305,28 @@ if __name__ == "__main__":
         tmp_time_range = filter_time_range(
             full_time_range,
             num_samples_per_month=args.num_samples_per_month,
-            enforce_year="2018",
+            enforce_year=None,
         )
+    else:
+        tmp_time_range = full_time_range
     # log_time_range = pd.DatetimeIndex([date for date in full_time_range if date not in tmp_time_range])
     log_time_range = tmp_time_range
     ds = xr.open_zarr(args.data_path).sel(time=ref_time_range)
-    ds = ds.sel(latitude=slice(-88.5, 90))  # crop south pole
+    if args.crop_south_pole:
+        ds = crop_south_pole(ds)
 
     accelerator = Accelerator()
 
     if accelerator.is_main_process:
         pprint.pp(args.__dict__)
 
-    lsm_tensor = torch.from_numpy(
-        ds["land_sea_mask"].transpose("latitude", "longitude").values
-    ).float()
+    if args.lsm_path:
+        lsm_tensor = torch.load(args.lsm_path, weights_only=True).float()
+        lsm_tensor = lsm_tensor[1:, :]  # crop south pole
+    else:
+        lsm_tensor = torch.from_numpy(
+            ds["land_sea_mask"].transpose("latitude", "longitude").values
+        ).float()
     if args.lsm_path:
         lsm_tensor = torch.load(args.lsm_path, weights_only=True)  # (lat, lon)
         lsm_tensor = lsm_tensor[1:, :]  # crop south pole (first row)
@@ -271,6 +338,7 @@ if __name__ == "__main__":
         orography_tensor = orography_tensor[:, 1:, :]  # crop south pole (first row)
 
     static_conditioning_tensor = None
+    static_terrain_input = None
     if args.lsm_path is not None:
         static_conditioning_tensor = lsm_tensor.unsqueeze(0)  # (1, lat, lon)
         if args.orography_path is not None:
@@ -285,12 +353,19 @@ if __name__ == "__main__":
         static_mean_tensor = static_conditioning_tensor.mean(
             dim=(1, 2), keepdim=True
         )  # (C, 1, 1)
-        static_std_tensor = static_conditioning_tensor.std(dim=(1, 2), keepdim=True)
+        static_std_tensor = static_conditioning_tensor.std(
+            dim=(1, 2), keepdim=True
+        ).clamp(min=1e-6)
         static_conditioning_tensor = (
             static_conditioning_tensor - static_mean_tensor
         ) / static_std_tensor
+        static_terrain_input = static_conditioning_tensor.unsqueeze(0)
 
-    ds = ds[var_list]
+    selected_vars = [v for v in normalization_param_dict.keys() if v in ds.data_vars]
+    missing = [v for v in normalization_param_dict.keys() if v not in ds.data_vars]
+    if missing:
+        raise KeyError(f"Missing variables in dataset: {missing}")
+    ds = ds[selected_vars]
 
     if args.load_ds_in_memory:
         ds = ds.load()
@@ -317,9 +392,16 @@ if __name__ == "__main__":
         raise NotImplementedError(f"Unknown autoregressive model class: {args.ar_cls}")
 
     if args.ar_model_path is not None:
-        ar_model = ar_model_cls.from_pretrained(args.ar_model_path)
+        ar_model = ar_model_cls.from_pretrained(
+            args.ar_model_path,
+            low_cpu_mem_usage=False,
+        )
     elif args.ar_model_name is not None:
-        ar_model = ar_model_cls.from_pretrained(repo_name, subfolder=args.ar_model_name)
+        ar_model = ar_model_cls.from_pretrained(
+            repo_name,
+            subfolder=args.ar_model_name,
+            low_cpu_mem_usage=False,
+        )
     else:
         raise ValueError("Please provide a valid AR model path or name")
 
@@ -330,8 +412,74 @@ if __name__ == "__main__":
     ar_model = ar_model.to(accelerator.device)
     encdec_model = encdec_model.to(accelerator.device)
 
+    terrain_features = None
+    terrain_channels = getattr(ar_model.config, "terrain_channels", 0) or 0
+    if terrain_channels > 0:
+        if args.terrain_encoder_path is None:
+            if args.ar_model_path is not None:
+                candidate_path = os.path.join(
+                    os.path.dirname(args.ar_model_path), "terrain_encoder.pt"
+                )
+                if os.path.exists(candidate_path):
+                    args.terrain_encoder_path = candidate_path
+        if args.terrain_encoder_path is None:
+            raise ValueError(
+                "This AR checkpoint expects terrain conditioning "
+                f"(terrain_channels={terrain_channels}), but no terrain encoder was "
+                "provided. Pass --terrain_encoder_path, normally the "
+                "terrain_encoder.pt next to the checkpoint's ar_model directory."
+            )
+        if static_terrain_input is None:
+            raise ValueError(
+                "Terrain conditioning requires --lsm_path and --orography_path."
+            )
+        terrain_encoder = TerrainEncoder(
+            in_channels=static_terrain_input.shape[1],
+            embed_dim=args.terrain_embed_dim,
+            out_channels=terrain_channels,
+            phys_nlat=static_terrain_input.shape[-2],
+            phys_nlon=static_terrain_input.shape[-1],
+            latent_nlat=args.terrain_latent_nlat,
+            latent_nlon=args.terrain_latent_nlon,
+            use_sht=args.terrain_use_sht,
+        )
+        terrain_encoder.load_state_dict(
+            torch.load(
+                args.terrain_encoder_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+        )
+        terrain_encoder = terrain_encoder.eval().to(accelerator.device)
+        with torch.no_grad():
+            terrain_features = terrain_encoder(
+                static_terrain_input.to(accelerator.device)
+            )
+        if args.zero_terrain_features:
+            terrain_features = torch.zeros_like(terrain_features)
+
+    encdec_static_channels = getattr(encdec_model.config, "static_channels", 0) or 0
+    static_tensor4encdec = static_conditioning_tensor
+    if encdec_static_channels == 0:
+        static_tensor4encdec = None
+    elif static_tensor4encdec is None:
+        raise ValueError(
+            "The encoder-decoder expects static conditioning "
+            f"(static_channels={encdec_static_channels}), but no static tensors were "
+            "provided."
+        )
+
     noise_scheduler = instantiate_from_config(noise_scheduler_config)
-    pipeline = AutoRegressive2DPipeline(ar_model, scheduler=noise_scheduler)
+    model_kwargs = {}
+    if terrain_features is not None:
+        model_kwargs["terrain_features"] = terrain_features
+    pipeline = AutoRegressive2DPipeline(
+        ar_model, scheduler=noise_scheduler, model_kwargs=model_kwargs
+    )
+
+    if accelerator.is_main_process and args.save_as_latent:
+        os.makedirs(args.output, exist_ok=True)
+    accelerator.wait_for_everyone()
 
     # Determine batch size and number of batches
     batch_size = (
@@ -374,18 +522,23 @@ if __name__ == "__main__":
                 normalization_param_dict=normalization_param_dict,
                 encdec_model=encdec_model,
                 encdec_model_type="ae",
-                static_tensor4encdec=static_conditioning_tensor,
+                static_tensor4encdec=static_tensor4encdec,
                 latent_transform="normalize",
                 latent_transform_args=transform_args,
                 sampler_type=args.sampler_type,
                 input_seq_len=args.input_seq_len,
                 dataset_interval_hour=args.dataset_interval_hour,
                 total_lead_time_hour=args.total_lead_time_hour,
-                log_pred_interval_hour=args.log_pred_interval_hour,
                 step_size_hour=args.step_size_hour,
                 return_tensor=True,
                 return_latent=args.save_as_latent,
                 noise_level=args.noise_level,
+                pad_input_height_to=args.pad_input_height_to,
+                sampler_kwargs=(
+                    {"model_kwargs": model_kwargs}
+                    if model_kwargs and args.sampler_type == "edm"
+                    else None
+                ),
             )  # (ensemble_size, C, T, H, W)
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:

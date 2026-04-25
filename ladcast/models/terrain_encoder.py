@@ -43,8 +43,8 @@ class TerrainEncoder(nn.Module):
         4. GSNO block at latent resolution (refinement)
         5. Project: 1x1 conv to out_channels
 
-    The output_gate is initialized to zero so that terrain conditioning
-    is gradually introduced during training (identity-biased init).
+    The output_gate is initialized neutrally so that the encoder itself does not
+    suppress terrain features before the AR model decides how much to inject.
     """
 
     def __init__(
@@ -61,6 +61,7 @@ class TerrainEncoder(nn.Module):
         mlp_ratio: float = 2.0,
         use_sht: bool = True,
         grid: str = "equiangular",
+        output_gate_init: float = 0.0,
     ):
         super().__init__()
 
@@ -118,8 +119,9 @@ class TerrainEncoder(nn.Module):
         self.decoder = nn.Conv2d(embed_dim, out_channels, 1, bias=False)
         nn.init.normal_(self.decoder.weight, std=math.sqrt(1.0 / embed_dim))
 
-        # Gating: start near zero so terrain conditioning is gradually introduced
-        self.output_gate = nn.Parameter(torch.zeros(1))
+        # Keep the encoder-side gate neutral (sigmoid=0.5). The AR-side
+        # injection gate controls how much terrain enters the model.
+        self.output_gate = nn.Parameter(torch.full((1,), float(output_gate_init)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -149,6 +151,6 @@ class TerrainEncoder(nn.Module):
 
         # 5. Project and gate
         out = self.decoder(h)
-        out = out * self.output_gate.sigmoid()
+        out = out * torch.sigmoid(self.output_gate)
 
         return out

@@ -270,6 +270,8 @@ def roll_out_serial(
     return_tensor: bool = False,  # Whether to return a tensor instead of an xarray.Dataset
     return_latent: bool = False,  # Whether to return the latent tensor instead of the decoded tensor
     noise_level: Optional[float] = 0,  # Noise level for the latent space
+    sampler_kwargs: Optional[dict] = None,
+    pad_input_height_to: Optional[int] = None,
 ) -> Union[xr.Dataset, torch.Tensor]:
     """
     Generate predictions using the AutoRegressive2DPipeline for sequence-to-sequence and store them in an xarray.Dataset.
@@ -300,6 +302,7 @@ def roll_out_serial(
         return_size = ensemble_size
     else:
         return_size = 1
+    sampler_kwargs = sampler_kwargs or {}
     # import time
 
     if total_lead_time_hour % step_size_hour != 0:
@@ -316,6 +319,21 @@ def roll_out_serial(
         normalization_param_dict, xr_dataset.data_vars
     )
 
+    def pad_input_height(input_tensor: torch.Tensor) -> torch.Tensor:
+        if pad_input_height_to is None:
+            return input_tensor
+        current_height = input_tensor.shape[-2]
+        if current_height > pad_input_height_to:
+            raise ValueError(
+                f"Cannot pad input height {current_height} to {pad_input_height_to}."
+            )
+        pad_bottom = pad_input_height_to - current_height
+        if pad_bottom == 0:
+            return input_tensor
+        return torch.nn.functional.pad(
+            input_tensor, (0, 0, 0, pad_bottom), mode="constant", value=0.0
+        )
+
     # assert input_torch_dataset.data_augmentation == False, "Data augmentation should be disabled for roll_out."
     assert step_size_hour % dataset_interval_hour == 0, (
         "step_size_hour must be divisible by dataset_interval_hour."
@@ -326,22 +344,53 @@ def roll_out_serial(
                 "return_ensemble_mean must be False when return_latent is True."
             )
 
+    latent_shape = None
+    if return_latent:
+        if len(pred_timestamp) == 0:
+            raise ValueError("pred_timestamp must contain at least one timestamp.")
+        sample_input_datetime_list = [
+            pred_timestamp[0] - pd.Timedelta(hours=step_size_hour * i)
+            for i in range(input_seq_len - 1, -1, -1)
+        ]
+        sample_input_tensor = xarr_to_tensor(
+            xr_dataset.sel(time=sample_input_datetime_list),
+            mean_tensor=mean_tensor,
+            std_tensor=std_tensor,
+        )
+        sample_input_tensor = pad_input_height(sample_input_tensor)
+        encdec_kwargs = {}
+        if static_tensor4encdec is not None:
+            encdec_kwargs["static_conditioning_tensor"] = static_tensor4encdec.unsqueeze(
+                0
+            ).to(encdec_model.device)
+        sample_encoded_latents = encdec_model.encode(
+            sample_input_tensor.permute(1, 0, 2, 3).to(encdec_model.device),
+            **encdec_kwargs,
+        )
+        if encdec_model_type == "ae":
+            sample_known_latents = sample_encoded_latents.latent
+        else:
+            raise ValueError("Unknown encdec_model_type.")
+        latent_shape = tuple(sample_known_latents.shape[1:])
+        del sample_input_tensor, sample_encoded_latents, sample_known_latents
+
     # start_date = pd.to_datetime(xr_dataset['time'].values[(input_seq_len-1)*(step_size_hour//dataset_interval_hour)])
     # end_date = pd.to_datetime(xr_dataset['time'].values[-1])
     # time_range = pd.date_range(start=start_date, end=end_date, freq=f'{log_pred_interval_hour}h')
     # print(f"Start date: {start_date}, End date: {end_date}, Time range: {time_range}")
     if not return_tensor:
         if return_latent:
+            latent_channels, latent_height, latent_width = latent_shape
             coords = {
                 "idx": np.arange(ensemble_size),
                 "time": pred_timestamp,
-                "C": np.arange(encdec_model.config.latent_channels),
+                "C": np.arange(latent_channels),
                 "prediction_timedelta": np.arange(0, (total_num_steps + 1))
                 * step_size_hour
                 * 3600
                 * 10**9,
-                "H": np.arange(15),
-                "W": np.arange(30),
+                "H": np.arange(latent_height),
+                "W": np.arange(latent_width),
             }
             tmp_shape = tuple(
                 len(coords[d])
@@ -410,14 +459,15 @@ def roll_out_serial(
             # print("output_dataset:", output_dataset)
     else:
         if return_latent:
+            latent_channels, latent_height, latent_width = latent_shape
             output_tensor = torch.full(
                 (
                     len(pred_timestamp),
                     return_size,
-                    encdec_model.config.latent_channels,
+                    latent_channels,
                     total_num_steps + 1,
-                    15,
-                    30,
+                    latent_height,
+                    latent_width,
                 ),
                 float("nan"),
                 dtype=torch.float32,
@@ -459,6 +509,7 @@ def roll_out_serial(
             mean_tensor=mean_tensor,
             std_tensor=std_tensor,
         )  # (C, T, H, W)
+        input_tensor = pad_input_height(input_tensor)
         if return_tensor and not return_latent:
             # output_tensor[cur_pred_idx, :, :, 0, :, :] = input_tensor[:, -1, :, :].clone().expand(return_size, -1, -1, -1)
             output_tensor[cur_pred_idx, :, :, 0, :, :] = (
@@ -468,11 +519,14 @@ def roll_out_serial(
             )
 
         # Encode the known latents using the VAE
+        encdec_kwargs = {}
+        if static_tensor4encdec is not None:
+            encdec_kwargs["static_conditioning_tensor"] = static_tensor4encdec.unsqueeze(
+                0
+            ).to(encdec_model.device)
         encoded_latents = encdec_model.encode(
             input_tensor.permute(1, 0, 2, 3).to(encdec_model.device),
-            static_conditioning_tensor=static_tensor4encdec.unsqueeze(0).to(
-                encdec_model.device
-            ),
+            **encdec_kwargs,
         )
         if encdec_model_type == "ae":
             known_latents = encoded_latents.latent  # (T, C, H, W)
@@ -552,6 +606,7 @@ def roll_out_serial(
                 timestamps=timestamps,
                 sampler_type=sampler_type,
                 device=pipeline._execution_device,
+                sampler_kwargs=sampler_kwargs,
             )
 
             if not return_tensor:
@@ -583,6 +638,10 @@ def roll_out_serial(
                     mean_tensor=mean_tensor,
                     std_tensor=std_tensor,
                 )
+                if decoded_tensor.shape[-2] != len(xr_dataset.latitude):
+                    decoded_tensor = decoded_tensor[
+                        ..., : len(xr_dataset.latitude), :
+                    ]
 
             if not return_tensor:
                 if return_latent:

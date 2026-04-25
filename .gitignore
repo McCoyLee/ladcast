@@ -16,3 +16,7 @@ ladcast/configs/
 checkpoints/
 static/
 output/
+predictions/
+metrics/
+Docs/
+baselines/

@@ -104,7 +104,7 @@ ema:
 
 # --- General ---
 general:
-  output_dir: "./output/ladcast_terrain"
+  output_dir: "./output/ladcast_terrain_zero"
   logging_dir: "logs"
   seed: 42
   channel_names:
@@ -126,7 +126,7 @@ general:
   checkpointing_steps: 5000
   save_model_epochs: 10
   save_image_epochs: 5
-  tracker_project_name: "ladcast-terrain"
+  tracker_project_name: "ladcast-terrain-zero"
   subbatch_steps: 1
   symmetry:
     enabled: false
